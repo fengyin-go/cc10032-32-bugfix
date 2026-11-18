@@ -1,6 +1,9 @@
 """迟到处理领域服务：定义流式计算中迟到数据的处理策略。
 
 增强能力: 迟到计数统计、阈值报警、旁路输出调度、迟到数据标记、与补数联动触发
+
+序号32修复：迟到处理模块读取当前窗口指标数据和策略版本，生成迟到补算清单；
+旧口径窗口指标保持原样可追溯，不按新口径静默重写。
 """
 from __future__ import annotations
 
@@ -8,6 +11,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.window_config import WindowConfigService
 from app.store import store
 
 
@@ -138,6 +142,93 @@ class LateHandlerService(BaseModuleService):
             "late_count": late_count,
             "backfill_job_id": job["id"],
             "backfill_job_name": job["作业名称"],
+        }
+
+    def generate_late_recompute_list(self, policy_name: str) -> dict[str, Any]:
+        """读取当前窗口指标数据和策略版本，生成迟到补算清单。
+
+        水位只依据当前生效版本的窗口边界和允许延迟计算；命中的迟到事件
+        按窗口归组写入补算清单，并回写到当前版本窗口指标数据上（状态详情
+        可核对版本、水位和迟到事件）。旧版本窗口指标保持旧口径可追溯，
+        不按新口径静默重写。
+        """
+        window_svc = WindowConfigService()
+        policy = window_svc.current_effective_policy(policy_name)
+        if policy is None:
+            return {"ok": False, "error": f"窗口策略「{policy_name}」不存在或未生效"}
+        version = window_svc.policy_version_of(policy)
+        allowed_late = window_svc._allowed_lateness(policy)
+
+        metrics = window_svc.window_metrics_for(policy_name, version)
+        if not metrics:
+            return {
+                "ok": True,
+                "policy": policy_name,
+                "policy_version": version,
+                "allowed_lateness": allowed_late,
+                "recompute_list": [],
+                "late_count": 0,
+                "metrics_checked": 0,
+            }
+
+        recompute_list: list[dict[str, Any]] = []
+        total_late = 0
+        for metric in metrics:
+            windows = metric.get("window_definitions", [])
+            if not windows:
+                continue
+            # 当前版本水位：依据该版本窗口边界和允许延迟计算
+            window_end_max = max(w.get("window_end", 0) for w in windows)
+            watermark = window_end_max - allowed_late
+            cutoff = watermark - allowed_late
+
+            # 找到该指标绑定的上游批次事件
+            events: list[dict[str, Any]] = []
+            batch_id = metric.get("batch_id")
+            for row in store.rows("stream_source"):
+                if batch_id and row.get("batch_id") == batch_id:
+                    events = row.get("events", [])
+                    break
+            late_events = [e for e in events if e.get("event_time", 0) < cutoff]
+
+            # 迟到事件按窗口归组，生成补算清单
+            metric_list: list[dict[str, Any]] = []
+            for w in windows:
+                ws, we = w.get("window_start", 0), w.get("window_end", 0)
+                win_late = [
+                    e for e in late_events
+                    if ws <= e.get("event_time", 0) < we
+                ]
+                if not win_late:
+                    continue
+                metric_list.append({
+                    "window_start": ws,
+                    "window_end": we,
+                    "late_count": len(win_late),
+                    "late_event_ids": [e.get("event_id", "") for e in win_late],
+                    "policy": policy_name,
+                    "policy_version": version,
+                    "allowed_lateness": allowed_late,
+                    "watermark": watermark,
+                    "metric_id": metric.get("id"),
+                    "reason": "事件时间早于当前版本水位截止，需按当前口径补算",
+                })
+            total_late += len(late_events)
+            # 回写当前版本窗口指标数据：详情可核对绑定版本、水位和迟到事件
+            metric["watermark"] = watermark
+            metric["late_events"] = len(late_events)
+            metric["late_recompute_list"] = metric_list
+            metric["recompute_generated_at"] = time.time()
+            recompute_list.extend(metric_list)
+
+        return {
+            "ok": True,
+            "policy": policy_name,
+            "policy_version": version,
+            "allowed_lateness": allowed_late,
+            "recompute_list": recompute_list,
+            "late_count": total_late,
+            "metrics_checked": len(metrics),
         }
 
     def list_late_statistics(self) -> list[dict[str, Any]]:

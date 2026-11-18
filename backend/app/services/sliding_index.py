@@ -1,6 +1,10 @@
 """滑动指标领域服务：定义基于滑动窗口的实时指标计算规则。
 
 增强能力: 条件过滤、快照频率校验、过期清理、指标聚合输出、跨模块指标查询
+
+序号32修复：与窗口配置共享同一根因——指标计算必须绑定当前生效策略版本。
+滑动指标只读取当前版本的窗口指标数据，策略切换后在详情窗口可核对
+切换结果（指标记录其计算所依据的策略版本）；状态按单向生命周期流转。
 """
 from __future__ import annotations
 
@@ -8,6 +12,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.window_config import WindowConfigService
 from app.store import store
 
 
@@ -19,6 +24,91 @@ class SlidingIndexService(BaseModuleService):
     STATUS_ORDER = ["草稿", "计算中", "已生效", "已过期"]
     ACTION_RULES = {"启用指标": "草稿", "停用指标": "计算中"}
     NEGATIVE_ACTIONS = ["停用指标"]
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """单向生命周期流转：草稿→计算中→已生效→已过期。
+
+        非法流转直接拒绝且不改动任何状态（事务回滚保留原状态）；
+        状态变更后接口读取的仍是同一版本记录。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        source = self.ACTION_RULES.get(action)
+        if source is None:
+            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
+        current = entry.get("status")
+        if current != source:
+            return None, (
+                f"{self.ENTITY}当前状态「{current}」不允许执行「{action}」，"
+                f"需处于「{source}」状态"
+            )
+        idx = self.STATUS_ORDER.index(source)
+        target = self.STATUS_ORDER[min(idx + 1, len(self.STATUS_ORDER) - 1)]
+        entry["status"] = target
+        entry["pending"] = target != self.STATUS_ORDER[-1]
+        entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        return entry, f"{self.ENTITY}已{action}"
+
+    def compute_from_window_metrics(
+        self, index_name: str, policy_name: str,
+    ) -> dict[str, Any]:
+        """从当前生效策略版本的窗口指标数据计算滑动指标。
+
+        与窗口配置共享同一根因修复：只读取绑定当前策略版本的窗口指标，
+        旧版本数据不并入；计算结果记录所依据的策略版本，策略切换后在
+        详情窗口可核对切换结果。
+        """
+        index_def = None
+        for r in store.rows(self.MODULE):
+            if r.get("指标名称") == index_name:
+                index_def = r
+                break
+        if index_def is None:
+            return {"ok": False, "error": f"指标「{index_name}」不存在"}
+
+        window_svc = WindowConfigService()
+        policy = window_svc.current_effective_policy(policy_name)
+        if policy is None:
+            return {"ok": False, "error": f"窗口策略「{policy_name}」不存在或未生效"}
+        version = window_svc.policy_version_of(policy)
+
+        metrics = window_svc.window_metrics_for(policy_name, version)
+        windows = [
+            w for m in metrics for w in m.get("window_definitions", [])
+        ]
+        if not windows:
+            return {
+                "ok": False,
+                "error": f"策略「{policy_name}」当前版本 v{version} 暂无窗口指标数据",
+            }
+
+        agg_func = index_def.get("聚合函数", "count").lower()
+        counts = [float(w.get("event_count", 0)) for w in windows]
+        if agg_func == "count":
+            result = float(len(windows))
+        elif agg_func == "avg":
+            result = sum(counts) / len(counts) if counts else 0.0
+        elif agg_func == "max":
+            result = max(counts) if counts else 0.0
+        elif agg_func == "min":
+            result = min(counts) if counts else 0.0
+        else:  # sum 及其他聚合按求和兜底
+            result = sum(counts)
+
+        # 指标记录绑定计算所依据的策略版本，供详情窗口核对切换结果
+        index_def["_last_policy_version"] = version
+        index_def["_last_window_metric_ids"] = [m.get("id") for m in metrics]
+        index_def["_computed_at"] = time.time()
+        return {
+            "ok": True,
+            "index": index_name,
+            "policy": policy_name,
+            "policy_version": version,
+            "windows": len(windows),
+            "agg_func": agg_func,
+            "result": result,
+        }
 
     def evaluate_index_condition(
         self, index_name: str, data: dict[str, Any],
